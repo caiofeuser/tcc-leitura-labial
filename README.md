@@ -28,6 +28,15 @@ Código e pesos dos modelos ficam fora do git (licenças não comerciais): `thir
 
 `third_party/vsr_ml` é usado por todos: ele traz o rosto médio do LRW, que serve de referência para alinhar o recorte. O MediaPipe precisa de `checkpoints/face_landmarker.task`.
 
+## Arquivos
+
+| Arquivo | O que tem |
+|---|---|
+| `poc.py` | O pipeline: leitura do vídeo, segmentação pelo áudio, recorte da boca e avaliação |
+| `modelos.py` | Os 4 extratores congelados e o `MODELOS`, que liga o nome do `--modelo` ao loader |
+| `controles.py` | Controle negativo (pausas) e teste de permutação |
+| `test_poc.py` | Teste da segmentação num áudio sintético (`uv run python test_poc.py`) |
+
 ## O que o script faz
 
 1. **Segmenta pelo áudio:** acha o começo de cada frase pelas pausas (energia do som).

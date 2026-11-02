@@ -7,51 +7,48 @@
 Uso: uv run python controles.py data [--modelo todos] [--perm 1000]
 """
 import argparse
-from pathlib import Path
 
-import mediapipe as mp
 import numpy as np
 import torch
 from sklearn.model_selection import LeaveOneOut, cross_val_predict
 
 import poc
+from modelos import MODELOS
 
-MARGIN = 0.15  # s de silêncio exigidos antes e depois da janela de pausa
+MARGIN_S = 0.15  # silêncio exigido antes e depois da janela de pausa
 
 
 def pause_starts(audio, n_frames, k):
-    """Até k inícios (em quadros) de janelas inteiras dentro do silêncio, sem sobreposição."""
+    """Até k inícios (em quadros) de janelas inteiras dentro do silêncio, espalhados pela gravação."""
     speech = poc.speech_mask(audio)  # 1 valor a cada 10 ms
     win_s, starts, t = poc.WIN / poc.FPS, [], 0.0
     while t + win_s <= n_frames / poc.FPS:
-        a, b = int((t - MARGIN) * 100), int((t + win_s + MARGIN) * 100)
+        a, b = int((t - MARGIN_S) * 100), int((t + win_s + MARGIN_S) * 100)
         if a >= 0 and b <= len(speech) and not speech[a:b].any():
             starts.append(round(t * poc.FPS))
-            t += win_s
+            t += win_s  # janelas sem sobreposição
         else:
-            t += 0.04
-    # Espalha as escolhidas pela gravação inteira, em vez de pegar só o começo.
+            t += 1 / poc.FPS
     return [starts[i] for i in np.linspace(0, len(starts) - 1, min(k, len(starts))).round().astype(int)]
 
 
 def collect(data_dir, landmarker):
+    """Clipes de fala (como no poc.py) e o mesmo número de clipes de pausa, por vídeo."""
     fala, pausa = ([], []), ([], [])
-    for path in sorted(p for p in Path(data_dir).iterdir() if p.suffix.lower() in {".mov", ".mp4"}):
-        label, frames, audio = poc.label_from_name(path), poc.read_frames(path), poc.read_audio(path)
+    for path, label, frames, audio in poc.recordings(data_dir):
         onsets = poc.utterance_onsets(audio)
-        speech_starts = [round((t + poc.WIN_OFFSET_S) * poc.FPS) for t in onsets]
-        for out, starts in ((fala, speech_starts), (pausa, pause_starts(audio, len(frames), len(onsets)))):
-            for i in starts:
-                if i + poc.WIN <= len(frames) and (c := poc.crop_mouths(frames[i:i + poc.WIN], landmarker)) is not None:
-                    out[0].append(c)
-                    out[1].append(label)
-        print(f"{path.name}: {len(onsets)} janelas de fala, {sum(1 for l in pausa[1] if l == label)} de pausa")
+        pauses = pause_starts(audio, len(frames), len(onsets))
+        for (clips, labels), starts in [(fala, [round((t + poc.WIN_OFFSET_S) * poc.FPS) for t in onsets]),
+                                        (pausa, pauses)]:
+            found = poc.clips_at(frames, starts, landmarker)
+            clips += found
+            labels += [label] * len(found)
+        print(f"{path.name}: {len(onsets)} janelas de fala, {len(pauses)} de pausa")
     return fala, pausa
 
 
 def loo_hits(X, y):
-    return int((cross_val_predict(poc.make_pipeline(poc.StandardScaler(), poc.LogisticRegression(max_iter=5000)),
-                                  X, y, cv=LeaveOneOut()) == y).sum())
+    return int((cross_val_predict(poc.make_clf(), X, y, cv=LeaveOneOut()) == y).sum())
 
 
 def perm_p(X, y, hits, n, rng):
@@ -62,16 +59,14 @@ def perm_p(X, y, hits, n, rng):
 
 def main(data_dir, modelos, n_perm):
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(mp.tasks.vision.FaceLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path=str(poc.ROOT / "checkpoints/face_landmarker.task"))))
-    (fc, fy), (pc, py) = collect(data_dir, landmarker)
+    (fc, fy), (pc, py) = collect(data_dir, poc.make_landmarker())
     fy, py = np.array(fy), np.array(py)
     rng = np.random.default_rng(0)
 
     print(f"\nleave-one-out; p de permutação com {n_perm} embaralhamentos")
     print(f"{'modelo':10s} {'fala':>16s} {'pausa (controle)':>20s}")
     for nome in modelos:
-        f = poc.MODELOS[nome](device)
+        f = MODELOS[nome](device)
         with torch.no_grad():
             Xf, Xp = f(fc), f(pc)
         hf, hp = loo_hits(Xf, fy), loo_hits(Xp, py)
@@ -82,7 +77,7 @@ def main(data_dir, modelos, n_perm):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("data", nargs="?", default="data")
-    ap.add_argument("--modelo", default="todos", choices=[*poc.MODELOS, "todos"])
+    ap.add_argument("--modelo", default="todos", choices=[*MODELOS, "todos"])
     ap.add_argument("--perm", type=int, default=1000)
     args = ap.parse_args()
-    main(args.data, list(poc.MODELOS) if args.modelo == "todos" else [args.modelo], args.perm)
+    main(args.data, list(MODELOS) if args.modelo == "todos" else [args.modelo], args.perm)
