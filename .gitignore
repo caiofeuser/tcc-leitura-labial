@@ -12,3 +12,4 @@ checkpoints/
 *.mp4
 *.mov
 *.wav
+third_party/

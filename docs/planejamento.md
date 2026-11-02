@@ -188,7 +188,7 @@ Na ordem em que eu proporia, cada passo reaproveitando o anterior:
 
 Escolhas fechadas para seguir em frente; qualquer uma pode ser revista.
 
-1. Objetivo: as 6 oclusivas, vídeo no teste, áudio no treino (seção 1.2).
+1. Objetivo: as 6 oclusivas, só o vídeo entra no modelo; o áudio serve só para recortar (seção 1.2).
 2. Modelo: um só, de vídeo, pré-treinado e ajustado aos nossos dados (seção 5).
 3. Rotulagem: do menos ao mais trabalhoso (seção 4.4).
 4. Corpus balanceado, frase-veículo "Digo ___ baixinho", falantes da UFSC.
