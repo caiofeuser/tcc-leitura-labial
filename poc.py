@@ -69,15 +69,20 @@ def read_frames(path, width=960):
     return np.frombuffer(raw, np.uint8).reshape(-1, height, width, 3)
 
 
-def utterance_onsets(audio, min_gap_s=0.6, min_len_s=0.6):
-    """Começo de cada frase, pela energia: trechos acima do limiar separados por pausas."""
+def speech_mask(audio):
+    """Fala ou silêncio a cada 10 ms, pela energia do som."""
     hop = SR // 100
     rms = np.sqrt(np.mean(audio[: len(audio) // hop * hop].reshape(-1, hop) ** 2, axis=1)) + 1e-8
     db = np.convolve(20 * np.log10(rms), np.ones(5) / 5, "same")
     if db.max() < -60:
         raise ValueError("áudio mudo: confira o microfone usado na gravação")
     # Limiar no meio entre ruído (mediana: a maior parte da gravação é pausa) e fala (p99).
-    active = db > (np.median(db) + np.percentile(db, 99)) / 2
+    return db > (np.median(db) + np.percentile(db, 99)) / 2
+
+
+def utterance_onsets(audio, min_gap_s=0.6, min_len_s=0.6):
+    """Começo de cada frase: trechos de fala separados por pausas."""
+    active = speech_mask(audio)
     onsets, start, last = [], None, -10**9
     for i, a in enumerate(active):
         if not a:

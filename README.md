@@ -10,7 +10,10 @@ Contexto completo em `CLAUDE.md` e na pasta `docs/`.
 uv run python poc.py data                  # modelo padrão (lrw)
 uv run python poc.py data --modelo pt      # lrw | pt | braven | avhubert
 uv run python poc.py data --modelo todos   # roda todos e imprime uma tabela comparando
+uv run python controles.py data            # controle negativo (pausas) + teste de permutação
 ```
+
+`controles.py` repete a classificação em janelas das **pausas**, onde não há consoante. Se ali também der acima do acaso, o modelo está separando as gravações (sessão), não as consoantes.
 
 `data/` tem um vídeo por palavra, com o nome da palavra (`pato.mov`, `bato.mov`...). Em cada vídeo, a frase "Digo ___ baixinho" é repetida, com ~2 s de pausa entre as repetições. O rótulo sai do nome do arquivo (`cato` → /k/).
 
