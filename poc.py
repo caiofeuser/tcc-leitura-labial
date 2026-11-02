@@ -1,9 +1,10 @@
-"""POC: vídeo bruto → recorte da boca → features do LRW-TCN congelado → classificador das 6 oclusivas.
+"""POC: vídeo bruto → recorte da boca → features de um modelo pré-treinado congelado → classificador das 6 oclusivas.
 
-Uso: uv run python poc.py data/
+Uso: uv run python poc.py data/ [--modelo lrw|pt|todos]
 Cada arquivo em data/ tem o nome da palavra (pato.mov, bato_2.mp4 ...) e contém várias
 repetições de "Digo ___ baixinho" separadas por pausas.
 """
+import argparse
 import json
 import subprocess
 import sys
@@ -21,21 +22,23 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT / "third_party/lrw_tcn"))
-from lipreading.model import Lipreading  # noqa: E402
 
-FPS = 25  # taxa em que o LRW foi treinado
+FPS = 25  # taxa em que todos os modelos foram treinados
 SR = 16000
 WIN = 29  # quadros por clipe no LRW (1,16 s)
 # Início da janela relativo ao começo da frase: pula o "Di" de "Digo" e cobre "go ___ bai".
 # Calibrar olhando alguns recortes; nível 2 de rotulagem (MFA) substitui isto.
 WIN_OFFSET_S = 0.2
-MOUTH_SCALE = 2.0  # lado do recorte = MOUTH_SCALE × largura da boca (cantos 61-291)
+# Rosto médio do LRW: os 4 modelos foram treinados com recortes alinhados a ele.
+MEAN_FACE = np.load(ROOT / "third_party/vsr_ml/pipelines/detectors/mediapipe/20words_mean_face.npy")
+# Pontos estáveis (olho dir., olho esq., ponta do nariz, centro da boca) no rosto médio e no MediaPipe.
+REF_POINTS = np.stack([MEAN_FACE[36:42].mean(0), MEAN_FACE[42:48].mean(0), MEAN_FACE[31:36].mean(0),
+                       MEAN_FACE[48:68].mean(0)]).astype(np.float32)
+MP_POINTS = [(33, 133), (362, 263), (1,), (13, 14)]
 
 CLASSES = list("pbtdkg")
 PLACE = {"p": "bilabial", "b": "bilabial", "t": "alveolar", "d": "alveolar", "k": "velar", "g": "velar"}
 PAIRS = [("p", "b"), ("t", "d"), ("k", "g")]
-LIPS = [61, 291, 0, 17, 13, 14, 78, 308]  # landmarks do MediaPipe em volta da boca
 
 
 def label_from_name(path):
@@ -90,31 +93,38 @@ def utterance_onsets(audio, min_gap_s=0.6, min_len_s=0.6):
 
 
 def crop_mouths(frames, landmarker):
-    """Recorte 88×88 em cinza, normalizado como no treino do LRW. None se perder o rosto."""
-    centers, widths = [], []
+    """Alinha o rosto ao rosto médio do LRW (256×256), recorta 96×96 na boca e fica com o centro 88×88.
+
+    Mesma receita do pré-processamento do Ma et al. (VSR_for_Multiple_Languages). None se perder o rosto.
+    """
+    pts = []
     for f in frames:
         res = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(f)))
         if not res.face_landmarks:
             return None
-        pts = np.array([(res.face_landmarks[0][i].x * f.shape[1], res.face_landmarks[0][i].y * f.shape[0])
-                        for i in LIPS])
-        centers.append(pts.mean(0))
-        widths.append(np.linalg.norm(pts[0] - pts[1]))
-    # ponytail: sem alinhamento por rotação (assume rosto de frente); adicionar se a cabeça inclinar.
-    kernel = np.ones(5) / 5
-    centers = np.stack([np.convolve(np.pad(c, 2, mode="edge"), kernel, "valid") for c in np.array(centers).T], 1)
-    half = MOUTH_SCALE * np.median(widths) / 2
+        lm = res.face_landmarks[0]
+        pts.append([np.mean([(lm[i].x * f.shape[1], lm[i].y * f.shape[0]) for i in idx], 0) for idx in MP_POINTS])
+    pts = np.array(pts, np.float32)
     out = []
-    for f, (cx, cy) in zip(frames, centers):
-        x0, y0 = int(cx - half), int(cy - half)
-        pad = int(2 * half)
-        crop = cv2.copyMakeBorder(f, pad, pad, pad, pad, cv2.BORDER_REPLICATE)[y0 + pad:y0 + 2 * pad, x0 + pad:x0 + 2 * pad]
-        gray = cv2.cvtColor(cv2.resize(crop, (96, 96)), cv2.COLOR_RGB2GRAY)[4:92, 4:92]
-        out.append(gray)
+    for t, f in enumerate(frames):
+        # Média móvel de ±6 quadros tira o tremor dos landmarks, mantendo a posição do quadro atual.
+        w = pts[max(0, t - 6):t + 7].mean(0)
+        w += pts[t].mean(0) - w.mean(0)
+        M = cv2.estimateAffinePartial2D(w, REF_POINTS, method=cv2.LMEDS)[0]
+        face = cv2.warpAffine(cv2.cvtColor(f, cv2.COLOR_RGB2GRAY), M, (256, 256))
+        cx, cy = (M[:, :2] @ w[3] + M[:, 2]).round().astype(int)
+        crop = face[max(cy - 48, 0):cy + 48, max(cx - 48, 0):cx + 48]
+        out.append(cv2.resize(crop, (96, 96))[4:92, 4:92] if crop.shape != (96, 96) else crop[4:92, 4:92])
     return (np.stack(out).astype(np.float32) / 255 - 0.421) / 0.165
 
 
+# ---- Modelos: cada loader recebe o device e devolve f(clipes (N, 29, 88, 88)) -> features (N, D).
+# ponytail: média no tempo perde a duração da oclusão (pista de vozeamento); testar features por quadro depois.
+
 def load_lrw(device):
+    sys.path.insert(0, str(ROOT / "third_party/lrw_tcn"))
+    from lipreading.model import Lipreading
+
     cfg = json.loads((ROOT / "third_party/lrw_tcn/configs/lrw_resnet18_dctcn.json").read_text())
     model = Lipreading(
         modality="video", num_classes=500, backbone_type=cfg["backbone_type"], relu_type=cfg["relu_type"],
@@ -128,15 +138,82 @@ def load_lrw(device):
     model.load_state_dict(ckpt["model_state_dict"])
     # Tira a camada das 500 palavras: sai a média temporal da saída do TCN (1664-d).
     model.tcn.tcn_output = torch.nn.Identity()
-    return model.eval().to(device)
+    model = model.eval().to(device)
+    return lambda clips: model(_batch(clips, device), lengths=[WIN] * len(clips)).cpu().numpy()
 
 
-@torch.no_grad()
-def extract(model, clips, device):
-    """Ponto de troca do benchmark: recebe clipes (N, 29, 88, 88), devolve features (N, D)."""
-    x = torch.from_numpy(np.stack(clips))[:, None].to(device)
-    # ponytail: média no tempo perde a duração da oclusão (pista de vozeamento); testar features por quadro depois.
-    return model(x, lengths=[WIN] * len(clips)).cpu().numpy()
+def load_pt(device):
+    """Ma et al. (2022), treinado em português (CMU-MOSEAS-pt): ResNet-18 + Conformer de 12 blocos."""
+    _use_repo("vsr_ml")
+    from espnet.nets.pytorch_backend.transformer.encoder import Encoder
+
+    a = json.loads((ROOT / "checkpoints/vsr_pt/model.json").read_text())[2]
+    encoder = Encoder(
+        idim=80, attention_dim=a["adim"], attention_heads=a["aheads"], linear_units=a["eunits"],
+        num_blocks=a["elayers"], input_layer=a["transformer_input_layer"], dropout_rate=a["dropout_rate"],
+        positional_dropout_rate=a["dropout_rate"], attention_dropout_rate=a["transformer_attn_dropout_rate"],
+        encoder_attn_layer_type=a["transformer_encoder_attn_layer_type"], macaron_style=a["macaron_style"],
+        use_cnn_module=a["use_cnn_module"], cnn_module_kernel=a["cnn_module_kernel"],
+        zero_triu=a.get("zero_triu", False), a_upsample_ratio=a["a_upsample_ratio"], relu_type=a["relu_type"])
+    # Só o encoder: o decodificador de texto e a CTC ficam de fora.
+    sd = torch.load(ROOT / "checkpoints/vsr_pt/model.pth", map_location="cpu")
+    encoder.load_state_dict({k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")})
+    encoder = encoder.eval().to(device)
+    return lambda clips: encoder(_batch(clips, device), None)[0].mean(1).cpu().numpy()
+
+
+def load_braven(device):
+    """BRAVEn Large (Haliassos et al., 2024), auto-supervisionado em inglês e ajustado para VSR no LRS3."""
+    _use_repo("raven")
+    from espnet.nets.pytorch_backend.transformer.encoder import Encoder
+
+    # Hiperparâmetros de conf/model/visual_backbone/resnet_transformer_large.yaml (dropout zerado: só inferência).
+    encoder = Encoder(
+        idim=512, attention_dim=1024, attention_heads=16, linear_units=4096, num_blocks=24,
+        frontend="conv3d", input_layer="vanilla_linear", dropout_rate=0.0, positional_dropout_rate=0.0,
+        attention_dropout_rate=0.0, encoder_attn_layer_type="rel_mha", macaron_style=False,
+        use_cnn_module=False, cnn_module_kernel=31, zero_triu=False, a_upsample_ratio=1, relu_type="swish",
+        layerscale=True, init_values=0.1, ff_bn_pre=True, post_norm=False, gamma_zero=False, gamma_init=0.1,
+        mask_init_type=None, drop_path=0.0)
+    sd = torch.load(ROOT / "checkpoints/braven_large_lrs3vox2avs_vsr.pth", map_location="cpu")
+    encoder.load_state_dict({k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")})
+    encoder = encoder.eval().to(device)
+    # Este encoder espera (N, T, 88, 88): ele mesmo adiciona o canal.
+    return lambda clips: encoder(_batch(clips, device)[:, 0], None)[0].mean(1).cpu().numpy()
+
+
+def load_avhubert(device):
+    """AV-HuBERT Large ajustado em português (MuAViC-pt), port para Hugging Face sem fairseq. Só vídeo."""
+    sys.path.insert(0, str(ROOT / "third_party/avhubert"))
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from src.model.av2text_config import AV2TextConfig
+    from src.model.avhubert import AVHubertModel
+
+    repo = "nguyenvulebinh/AV-HuBERT-MuAViC-pt"
+    model = AVHubertModel(AV2TextConfig.from_pretrained(repo, token=False))
+    # Só o encoder (prefixo model.encoder.); o decodificador de texto fica de fora.
+    sd = load_file(hf_hub_download(repo, "model.safetensors", token=False))
+    pre = "model.encoder."
+    missing, _ = model.load_state_dict({k[len(pre):]: v for k, v in sd.items() if k.startswith(pre)}, strict=False)
+    assert not missing, missing
+    model = model.eval().to(device)
+    # audio=None: o próprio código zera o áudio antes da fusão (modo só-vídeo, visto no treino).
+    return lambda clips: model.extract_finetune({"audio": None, "video": _batch(clips, device)})[0].mean(1).cpu().numpy()
+
+
+MODELOS = {"lrw": load_lrw, "pt": load_pt, "braven": load_braven, "avhubert": load_avhubert}
+
+
+def _use_repo(name):
+    """vsr_ml e raven têm cada um seu pacote `espnet`; descarta o já importado antes de trocar de repo."""
+    for m in [m for m in sys.modules if m == "espnet" or m.startswith("espnet.")]:
+        del sys.modules[m]
+    sys.path.insert(0, str(ROOT / "third_party" / name))
+
+
+def _batch(clips, device):
+    return torch.from_numpy(np.stack(clips))[:, None].to(device)
 
 
 def cv_eval(X, y):
@@ -145,7 +222,35 @@ def cv_eval(X, y):
     return cross_val_predict(clf, X, y, cv=StratifiedKFold(k, shuffle=True, random_state=0))
 
 
-def main(data_dir):
+def evaluate(X, y):
+    """Imprime as métricas e devolve um resumo (acurácia de fonema e de vozeamento por par)."""
+    present = [c for c in CLASSES if c in y]
+    pred = cv_eval(X, y)
+    resumo = {"fonema": accuracy_score(y, pred)}
+    print(f"\n== Fonema ({len(present)} classes, acaso {1 / len(present):.0%}) ==")
+    print(f"acurácia {resumo['fonema']:.1%}")
+    print(classification_report(y, pred, labels=present, zero_division=0))
+    print("matriz de confusão (linha = verdade, coluna = previsto):", present)
+    print(confusion_matrix(y, pred, labels=present))
+
+    place = np.array([PLACE[c] for c in y])
+    if len(set(place)) > 1:
+        resumo["ponto"] = accuracy_score(place, cv_eval(X, place))
+        print(f"\n== Ponto ({len(set(place))} classes) == acurácia {resumo['ponto']:.1%}")
+
+    print("\n== Vozeamento dentro do par (acaso 50%) ==")
+    for pair in PAIRS:
+        m = np.isin(y, pair)
+        if len(set(y[m])) < 2:
+            continue
+        hits = int((cv_eval(X[m], y[m]) == y[m]).sum())
+        p = binomtest(hits, m.sum(), 0.5, alternative="greater").pvalue
+        resumo["/".join(pair)] = f"{hits}/{m.sum()} (p={p:.3f})"
+        print(f"/{pair[0]}/×/{pair[1]}/: {hits}/{m.sum()} = {hits / m.sum():.1%}  (p = {p:.3f})")
+    return resumo
+
+
+def main(data_dir, modelos):
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(mp.tasks.vision.FaceLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=str(ROOT / "checkpoints/face_landmarker.task"))))
@@ -164,30 +269,26 @@ def main(data_dir):
                 labels.append(label)
                 kept += 1
         print(f"{path.name}: /{label}/, {len(onsets)} frases, {kept} recortes")
+    y = np.array(labels)
 
-    X, y = extract(load_lrw(device), clips, device), np.array(labels)
-    present = [c for c in CLASSES if c in y]
+    resumos = {}
+    for nome in modelos:
+        print(f"\n######## modelo: {nome} ########")
+        with torch.no_grad():
+            X = MODELOS[nome](device)(clips)
+        print(f"features: {X.shape[1]} dimensões")
+        resumos[nome] = evaluate(X, y)
 
-    pred = cv_eval(X, y)
-    print(f"\n== Fonema ({len(present)} classes, acaso {1 / len(present):.0%}) ==")
-    print(f"acurácia {accuracy_score(y, pred):.1%}")
-    print(classification_report(y, pred, labels=present, zero_division=0))
-    print("matriz de confusão (linha = verdade, coluna = previsto):", present)
-    print(confusion_matrix(y, pred, labels=present))
-
-    place = np.array([PLACE[c] for c in y])
-    if len(set(place)) > 1:
-        print(f"\n== Ponto ({len(set(place))} classes) == acurácia {accuracy_score(place, cv_eval(X, place)):.1%}")
-
-    print("\n== Vozeamento dentro do par (acaso 50%) ==")
-    for pair in PAIRS:
-        m = np.isin(y, pair)
-        if len(set(y[m])) < 2:
-            continue
-        hits = int((cv_eval(X[m], y[m]) == y[m]).sum())
-        p = binomtest(hits, m.sum(), 0.5, alternative="greater").pvalue
-        print(f"/{pair[0]}/×/{pair[1]}/: {hits}/{m.sum()} = {hits / m.sum():.1%}  (p = {p:.3f})")
+    if len(resumos) > 1:
+        print("\n######## comparação ########")
+        for nome, r in resumos.items():
+            print(f"{nome:10s} " + "  ".join(f"{k}: {v:.1%}" if isinstance(v, float) else f"{k}: {v}"
+                                             for k, v in r.items()))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "data")
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("data", nargs="?", default="data", help="pasta com os vídeos")
+    ap.add_argument("--modelo", default="lrw", choices=[*MODELOS, "todos"])
+    args = ap.parse_args()
+    main(args.data, list(MODELOS) if args.modelo == "todos" else [args.modelo])
