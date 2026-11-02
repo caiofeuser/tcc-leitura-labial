@@ -45,7 +45,9 @@ def label_from_name(path):
 
 def read_audio(path):
     raw = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+        # async=1 preenche buracos pelos timestamps; sem isso o áudio da webcam deriva até 2,5 s do vídeo
+        ["ffmpeg", "-v", "error", "-i", str(path), "-af", "aresample=async=1", "-ac", "1", "-ar", str(SR),
+         "-f", "s16le", "-"],
         capture_output=True, check=True).stdout
     return np.frombuffer(raw, np.int16).astype(np.float32) / 32768
 
@@ -64,12 +66,15 @@ def read_frames(path, width=960):
     return np.frombuffer(raw, np.uint8).reshape(-1, height, width, 3)
 
 
-def utterance_onsets(audio, min_gap_s=0.3, min_len_s=0.6):
-    """Começo de cada frase, pela energia: trechos acima de (pico - 30 dB) separados por pausas."""
+def utterance_onsets(audio, min_gap_s=0.6, min_len_s=0.6):
+    """Começo de cada frase, pela energia: trechos acima do limiar separados por pausas."""
     hop = SR // 100
     rms = np.sqrt(np.mean(audio[: len(audio) // hop * hop].reshape(-1, hop) ** 2, axis=1)) + 1e-8
-    db = 20 * np.log10(rms)
-    active = db > np.percentile(db, 99) - 30
+    db = np.convolve(20 * np.log10(rms), np.ones(5) / 5, "same")
+    if db.max() < -60:
+        raise ValueError("áudio mudo: confira o microfone usado na gravação")
+    # Limiar no meio entre ruído (mediana: a maior parte da gravação é pausa) e fala (p99).
+    active = db > (np.median(db) + np.percentile(db, 99)) / 2
     onsets, start, last = [], None, -10**9
     for i, a in enumerate(active):
         if not a:
